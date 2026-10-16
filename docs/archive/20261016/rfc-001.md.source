@@ -1,0 +1,204 @@
+# RFC: Infrastructure Custodian (MCP-Fronted Infra Control Plane for Agents)
+
+Oct 8, 2026 · @David Ndungu · Status: Draft
+
+## Summary
+
+Build one custodian service that is the only identity allowed to change cloud infrastructure, and expose it to agents as a small catalog of typed MCP tools. Agents ask for an outcome (a staging database for a service); the custodian turns it into a Pulumi change, checks policy, and applies it.
+
+Agents never see Pulumi code and hold no write credentials, so they cannot skip Pulumi or route around it. The custodian is deterministic: typed operations, schema validation, policy as code, and Git as the source of truth. No LLM sits between an agent's request and the write path.
+
+## Decision requested
+
+Approve the sole-write-path architecture and Phase 1 hardening (read-only agent credentials, policy packs, cloud audit alerts). Building the custodian is gated on a time-boxed, owned evaluation of the options in §Alternatives for a typed, non-LLM request API with approvals, drift detection, and recovery; build only if none fits.
+
+## Background and problem
+
+Agents make all code and infrastructure changes today, and AGENTS.md tells them to use Pulumi for infrastructure. That guidance is advisory, so agents sometimes miss it and take another route.
+
+Three properties of the current setup cause this:
+
+- The instruction is probabilistic. Nothing fails when an agent ignores it.
+- Agents hold enough access to change infrastructure by other routes.
+- Agents must understand Pulumi, the repo layout, and company standards to make even a routine change.
+
+The env zero article on [self-service infrastructure with IaC](https://www.envzero.com/insights/self-service-infrastructure-with-iac-how-platform-teams-stop-being-the-bottleneck) describes the same shift for human developers. Platform teams define approved templates and guardrails up front, and developers consume them instead of queueing for review. This RFC applies that model with an agent as the consumer.
+
+## Goals and non-goals
+
+After agent write credentials are removed (final phase), the custodian makes "agent skipped Pulumi" impossible rather than unlikely; before that, it reduces bypass.
+
+**Goals**
+
+- Make the custodian the only write path to infrastructure. Agents get read-only access everywhere else.
+- Let agents request infrastructure by intent through typed MCP operations, with no Pulumi knowledge needed.
+- Enforce standards (tags, regions, sizes, public exposure) before deploy, not after.
+- Keep every change reviewable in Git and attributable to a specific agent identity.
+- Give agents a defined route when the catalog lacks what they need.
+
+**Non-goals**
+
+- Replacing Pulumi. It stays as the engine behind the custodian.
+- Putting an LLM in the write path.
+- Exposing a general "run any Pulumi program" tool.
+- Governing application code changes. This RFC covers infrastructure only.
+
+## Proposal overview
+
+The custodian is one service with three internal stages and the only set of cloud write credentials.
+
+&#91;embedded content: architecture · agents, custodian, repo, cloud\]
+
+Agents call typed MCP tools. The custodian validates the request, applies policy, runs Pulumi, commits to Git, and applies to the cloud. Humans approve only the Elevated and Sensitive classes.
+
+## MCP tool surface
+
+The first release exposes a handful of typed operations for the most common requests, plus lifecycle and read tools. Tool names below are illustrative.
+
+| Tool | What it does | Inputs | Changes infra? |
+| --- | --- | --- | --- |
+| `create_database` | Provisions the approved database pattern | env, size, name | Yes, after approval |
+| `add_service` | Adds a service from the approved service pattern | name, env, a few pattern inputs | Yes, after approval |
+| `grant_access` | Gives a named identity scoped access to a resource | identity, resource, level | Yes, human approval |
+| `apply_change` | Applies a previewed change | change ID | Yes |
+| `get_change_status` | Returns job state, preview diff, and approval state | change ID | No |
+| `get_status`, `get_outputs`, `get_cost` | Read-only views of an environment | project, env | No |
+| `request_capability` | Opens a PR or ticket against the catalog for review | description, justification | No |
+
+Three rules keep the catalog usable:
+
+- **Granularity.** Too low-level (a `create_bucket` with 40 parameters) recreates IaC with extra steps. Too high-level ("make me a prod environment") is unbounded. Aim for approved patterns with a few inputs each.
+- **Closed inputs.** Environment, size, and region come from approved enums, not free text.
+- **Secrets by reference.** Tools accept a reference to a secret, never its value.
+
+## Request lifecycle
+
+Every change is a two-phase request: preview first, apply second, with policy and approval in between.
+
+&#91;embedded content: request flow · 2 decisions, 1 human step\]
+
+A failed policy check or a denied approval returns the agent to its request with the reason. Low-risk changes skip the human step. Applies run as jobs, so the agent tracks progress by change ID.
+
+## Policy and approval classes
+
+Every change is classified by risk, and only the risky classes wait for a human.
+
+| Class | Examples | Decision |
+| --- | --- | --- |
+| Low risk | Dev or preview resources from catalog patterns, within size limits | Auto-approved when policy passes |
+| Elevated | Anything in prod; spend above a set threshold | Human approval |
+| Sensitive | Deletes; IAM changes and access grants | Human approval |
+| Out of policy | Violates a policy pack rule | Rejected with the reason and the fix |
+
+Pulumi CrossGuard policy packs run during preview and again in CI. They encode the guardrails: required tags, no public buckets, instance size limits, and approved regions. A rejection message names the rule and the allowed alternative, because agents recover well from an error that tells them the right path.
+
+The article's point applies here too: guardrails should make the safe path the easy path, so humans only see requests that are risky, unusual, or outside policy.
+
+## Identity, security and threat model
+
+The custodian holds the only write credentials, which makes it the highest-value target in the system. Its design assumes that agent requests are untrusted input.
+
+| Threat | Mitigation |
+| --- | --- |
+| Agent bypasses the custodian with its own tools | Preventive control: no write IAM reachable from agent runtimes; OIDC trust limited to the custodian workload, with CI and the custodian using OIDC-assumed roles. Harness deny rules block mutating `aws`, `gcloud`, `kubectl`, and `helm` calls, with a message pointing to the custodian; these are client-side defense in depth, not a security boundary. |
+| Prompt injection through a request | Typed operations with schema validation. No LLM interprets free text with write access. Any natural-language layer sits in front of the typed API, never in place of it. |
+| One agent touches another project's resources | Per-agent identity and scopes, for example agent X may change only project Y's dev environment. |
+| Runaway or looping agent | Rate limits per agent, plus cost and approval gates on elevated classes. |
+| Custodian credentials misused | Full audit logging, human break-glass path, and alerts on any cloud mutation from a principal that is not the custodian. |
+| Agent uses SDK calls, raw cloud APIs, other IaC tools, or ambient instance/workload credentials | The preventive control above is the only one that binds these: agent runtimes must have no ambient or instance credentials, no reachable write API access, and no path to IAM. A denylist of CLIs does not cover an agent that can execute code. |
+
+Agents keep read-only access for debugging, either directly or through the custodian: status, outputs, logs, and cost. Secrets are passed by reference and never appear in requests, previews, or logs.
+
+The design only holds if the custodian is the sole write path. Any remaining agent credential with write access defeats it, so removing them is the condition for calling the rollout complete, not a follow-up.
+
+## State and source of truth
+
+Desired state lives in a Git infra repo, not in the custodian's own database. The custodian drives Pulumi through the Automation API and commits the resulting changes to that repo.
+
+This keeps three properties that a private database would lose:
+
+- **Reviewable diffs.** Humans can read every change, including those made by agents.
+- **Detectable drift.** Scheduled `pulumi refresh` or drift detection compares reality to the repo.
+- **Auditable history.** Git records what changed, when, and under which agent identity.
+
+The custodian is stateless apart from job records for in-flight changes. If it is lost, the repo and Pulumi state are enough to rebuild it.
+
+## Escape hatch and catalog governance
+
+Agents will eventually need something the catalog does not offer, and without a defined route they either get stuck or the API widens until it is useless.
+
+`request_capability` is that route. The agent describes the need and why; the custodian opens a PR or ticket against the catalog for human review. It never changes infrastructure itself.
+
+The catalog stays healthy only with ownership:
+
+- Every operation, template, and policy has a named owner.
+- Owners review `request_capability` items for their area.
+- Unowned items are flagged and retired, because the article warns that self-service systems without owners drift out of date and lose trust.
+- Changes to an operation's inputs are versioned so they do not break agents mid-change.
+
+## Observability, drift and audit
+
+Three independent signals confirm the custodian is the only path and that infrastructure matches the repo.
+
+- **Request audit log.** Every request records the agent identity, inputs, preview, approvals, and outcome.
+- **Drift detection.** Scheduled `pulumi refresh` or an equivalent check surfaces any out-of-band change against the infra repo.
+- **Cloud audit alerts.** Alerts on cloud audit logs (CloudTrail or the equivalent) fire for any mutation from a principal other than the custodian.
+
+Agents can read change status and job progress through `get_change_status`, so a slow apply does not look like a failure.
+
+## Rollout plan
+
+Rollout runs in four phases, and agents lose direct write access only in the last one, after the custodian has proven itself.
+
+| Phase | Write credentials still in play | Pass criterion (gate) | Owner | Evidence |
+| --- | --- | --- | --- | --- |
+| 1. Harden | All existing agent write credentials; custodian not deployed | Read-only agent credentials live; CrossGuard policy packs enforced in CI; cloud-audit alerts on non-custodian mutations | Platform | Audit query over a defined window showing alerts firing and being triaged |
+| 2. Shadow | All existing agent write credentials; custodian deployed in preview-only mode | Preview + policy stage serves real agent requests with no apply; preview accuracy and rejection messages validated | Platform | Sample of catalog requests served preview-only, matched against what the patterns would apply |
+| 3. Controlled apply | All existing agent write credentials; custodian may apply | Custodian applies only Low-risk changes within a named pilot scope; Elevated and Sensitive remain human-gated | Platform | Pilot-scope audit showing zero non-custodian mutations |
+| 4. Cutover | Only custodian write credentials | All agent write credentials removed; the sole-write-path invariant holds | Platform | Cloud-audit query over a defined window showing zero non-custodian, non-break-glass mutations; credential inventory reconciled against IAM |
+
+"Proven itself" means Phase 3's gate: the custodian has applied real Low-risk changes in a pilot scope with zero out-of-band mutations observed.
+
+Phases run in order; no dates are set yet. Each gate must pass before the next phase starts. Phase 1 needs no custodian, so it can begin immediately. Until Phase 4's gate passes, agent write credentials still exist and the bypass guarantee is "reduced," not "impossible" — see §Goals.
+
+## Alternatives and build vs. buy
+
+The recommendation is to check each existing option for MCP support first, and build a thin custodian on the Pulumi Automation API only if none fits. The descriptions below come from general knowledge and have not been verified for this RFC.
+
+| Option | What it offers | To verify |
+| --- | --- | --- |
+| Status quo plus hardening | Read-only agent credentials, harness deny rules, CrossGuard policy packs | Still relies on agents choosing the right tool; no intent-level interface |
+| Crossplane | Typed claims over a control plane | Fit with a Pulumi-based workflow; MCP support |
+| Backstage or Port | Service catalog and self-service portal | Agent-facing API or MCP support; effort to operate |
+| Pulumi Deployments and IDP offerings | Pulumi-native deployment and platform features | Whether they expose a typed, MCP-reachable request surface |
+| [env zero](https://www.envzero.com/insights/self-service-infrastructure-with-iac-how-platform-teams-stop-being-the-bottleneck) | Supports Pulumi; templates, approvals, RBAC, drift detection, cost visibility. Its page banner advertises an autonomous cloud control plane in early access | MCP support and how that early-access product maps to this design |
+| Build a thin custodian | Typed MCP tools over the Pulumi Automation API, as described in this RFC | Ongoing ownership of the service and catalog |
+
+The problem here is agents bypassing the toolchain, not human approval queues. Hardening alone addresses bypass; the custodian also removes the need for agents to know Pulumi.
+
+## Risks, success metrics and open questions
+
+The main risk is a catalog that is too narrow to be useful or too wide to be safe, and the second is a custodian that becomes a bottleneck of its own.
+
+**Risks**
+
+- Catalog too narrow: agents hit the escape hatch constantly and the review queue becomes the new bottleneck.
+- Catalog too wide: operations accumulate parameters until the custodian is IaC with extra steps.
+- Custodian compromise: it holds the only write credentials, so its hardening and audit trail are critical.
+- Incomplete credential removal: one leftover write credential on an agent defeats the design.
+
+**Success metrics**
+
+- Zero cloud mutations from principals other than the custodian, as shown by cloud audit logs.
+- Share of infra requests served by the catalog without using `request_capability`.
+- Time from request to applied change for auto-approved requests.
+- Share of changes that reach human approval, tracked to confirm the classes are tuned correctly.
+
+**Open questions**
+
+- [ ] Which agent harness and which cloud(s) are in scope? This sets the deny rules and the credential model.
+- [ ] What are the approval thresholds, including the spend limit that moves a change to Elevated?
+- [ ] Where do humans approve: a PR, a chat message, or a dashboard?
+- [ ] Which 5 to 10 patterns make up the first catalog?
+- [ ] How is per-agent identity issued and revoked?
+- [ ] Build or buy: which existing options expose MCP, and do any fit?
